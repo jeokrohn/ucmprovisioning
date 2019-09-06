@@ -1,0 +1,337 @@
+
+# target for AXl operations
+target:
+  ucm: emea-cm-pub.example.com
+  auth:
+    user: Administrator
+    password: <some password>
+
+# suffix to be appended to processnode names not already CFQDN
+node_domain_suffix: example.com
+
+# this needs to be set before everything else
+cluster_id: EMEACluster
+
+enterprise_parameter:
+
+  # Cluster Fully Qualified Domain name and
+  # Organizaton Top Level Domain
+  ClusterName: us-cm-pub.example.com *.example.com
+  OrganizationDomain: example.com
+
+  # Auto registration protocol: SIP
+  AutoRegistrationPhoneProtocol: 1
+
+  # Enable Dependency Records
+  CCMAdminEnableDependencyRecords: T
+
+  # URI lookup policy: case insensitive
+  URILookupPolicy: 1
+
+service_parameter:
+  ucm:
+    # Apply Transformations On Remote Number = True
+    ApplyTransformationsOnRemoteNumber: T
+
+    # T302 = 5000
+    TimerT302_msec: 5000
+
+    # AAR enabled
+    AAREnable: T
+
+    # Enable Call Diagnostics (when CDRs are enabled)
+    CallDiagnosticsEnabled: 1
+
+    # G.722 enabled for all devices
+    G722CodecEnabled: 1
+
+    StopRoutingOnQ931DisconnectCauseValues: 3 21 27 28 38 42 63
+
+    # Set "Default Inter-Presence Group Subscription" to "Allow Subscription"
+    DefaultPresenceSubscriptionPolicy: 1
+
+    # set "BLF Status Depicts DND" to "True"
+    IncludeDNDStatus: T
+
+    # Enable CDR
+    CdrEnabled:
+      per_node: true
+      value: T
+    CdrLogCallsWithZeroDurationFlag:
+      per_node: true
+      value: T
+
+    # Set digit analysis complexity
+    DigitAnalysisComplexity:
+      per_node: true
+      value: 1
+
+services:
+  ucm:
+    # services to enable on UCM nodes
+    Cisco CallManager:
+    Cisco CTIManager:
+    Cisco Extension Mobility:
+    Cisco Location Bandwidth Manager:
+    Cisco Dialed Number Analyzer Server:
+    Cisco Dialed Number Analyzer:
+    Cisco Tftp:
+    Cisco CTL Provider:
+    Cisco Bulk Provisioning Service:
+      pub_only: True
+    Cisco Intercluster Lookup Service:
+      pub_only: True
+    Cisco Certificate Authority Proxy Function:
+      pub_only: True
+    Cisco DirSync:
+      pub_only: True
+    Self Provisioning IVR:
+      pub_only: True
+
+
+  imp:
+    # services to enable on IM&P nodes
+    Cisco SIP Proxy:
+    Cisco Presence Engine:
+    Cisco XCP Authentication Service:
+    Cisco XCP Connection Manager:
+    Cisco XCP Text Conference Manager:
+
+
+
+base_dialplan:
+
+  SIPProfiles:
+    FQDN:
+      description: Use FQDN in SIP requests
+      enableOutboundOptionsPing: true
+      optionsPingIntervalWhenStatusOK: 10
+      optionsPingIntervalWhenStatusNotOK: 20
+      enableUriOutdialSupport: t
+      earlyOfferSuppVoiceCall: Best Effort (no MTP inserted)
+
+  AAR Groups:
+    - Default
+
+  partitions:
+    DN: +E.164 DNs
+    URI: local URIs
+    ESN: local ESNs
+    B2B_URI: B2B SIP routing
+    PSTNInternational: International PSTN RP
+    OnNetRemote: remote cluster on-net
+
+  CSSes:
+    DN:
+      description: +E.164 DNs only
+      clause: DN
+    AAR:
+      description: AAR
+      clause: PSTNInternational
+    ICTInbound:
+      description: Inbound CSS for inter-cluster trunk
+      clause: DN:ESN:URI:Directory URI
+
+  LRGs:
+    LRG_PSTN_1: regular PSTN calls (primary)
+    LRG_PSTN_2: regular PSTN calls (secondary)
+    LRG_Emergency_1: emergency calls (primary)
+    LRG_Emergency_2: emergency calls (secondary)
+    LRG_Video_1: ISDN video calls (primary)
+    LRG_Video_2: ISDN video calls (secondary)
+
+  routelists:
+    RL_PSTN:
+      description: RL for PSTN calls
+      members:
+        - LRG_PSTN_1
+        - LRG_PSTN_2
+        - Standard Local Route Group
+
+    RL_Emergency:
+      description: RL for emergency calls
+      members:
+        - LRG_Emergency_1
+        - LRG_Emergency_2
+        - LRG_PSTN_1
+        - LRG_PSTN_2
+        - Standard Local Route Group
+
+    RL_Video:
+      description: RL for video calls
+      members:
+        - LRG_Video_1
+        - LRG_Video_2
+        - LRG_PSTN_1
+        - LRG_PSTN_2
+        - Standard Local Route Group
+
+# dial plan configuration
+dialplan:
+  habits:
+    DE:
+      CC: 49
+      emergency: 112
+      internationalPrefix: 000
+      nationalPrefix: 00
+      normalisation:
+        00.[^0]!: true
+        000.!: false
+    IT:
+      CC: 39
+      emergency: 112
+      internationalPrefix: 000
+      nationalPrefix: 00
+      normalisation:
+        0.0[^0]!: true
+        000.!: false
+    UK:
+      CC: 44
+      emergency: 112
+      internationalPrefix: 900
+      nationalPrefix: 9
+      normalisation:
+        9.!: true
+        900.!: false
+
+  sites:
+    FKF:
+      # DIDs +4961007739XXX
+      ESN: 8496
+      ESNnonDID: 84968XXX
+      NDC: 6100
+      SN: 7739XXX
+      habit: DE
+    VIM:
+      # DIDs +390390295XXX
+      ESN: 8391
+      ESNnonDID: 83916XXX
+      NDC: 03902
+      SN: 95XXX
+      habit: IT
+    BDL:
+      # DIDs +440802571XXX
+      ESN: 8441
+      ESNnonDID: 84414XXX
+      NDC: 0802
+      SN: 571XXX
+      habit: UK
+
+# LDAP settings
+ldap:
+  fgt:
+    FGTlocal:
+      description: FGT for local users
+      homeCluster: true
+      allowCTIControl: true
+      imAndUcPresenceEnable: true
+    FGTremote:
+      description: FGT for remote users
+      homeCluster: false
+      allowCTIControl: false
+      imAndUcPresenceEnable: false
+
+  filter:
+    local: (|(telephoneNumber=+3*)(telephoneNumber=+4*))
+    remote: (telephoneNumber=+1*)
+
+  dn: ldapuser@example.com
+  ldap_password: <some password>
+
+  ldap_server:
+    - 192.168.220.10
+    - 192.168.220.11
+
+  ldap_directory:
+
+    local:
+      search_base: ou=DemoUsers,ou=Validate,dc=example,dc=com
+      filter: local
+      fgt: FGTlocal
+      accessControlGroup:
+        - Standard CCM End Users
+        - Standard CTI Enabled
+        - Standard CTI Allow Control of Phones supporting Rollover Mode
+        - Standard CTI Allow Control of Phones supporting Connected Xfer and conf
+
+    remote:
+      search_base: ou=DemoUsers,ou=Validate,dc=example,dc=com
+      filter: remote
+      fgt: FGTremote
+      accessControlGroup:
+        - Standard CCM End Users
+        - Standard CTI Enabled
+        - Standard CTI Allow Control of Phones supporting Rollover Mode
+        - Standard CTI Allow Control of Phones supporting Connected Xfer and conf
+
+
+    tme:
+      search_base: ou=TMEs,ou=Validate,dc=example,dc=com
+      filter:
+      fgt: FGTremote
+      accessControlGroup:
+        - Standard CCM End Users
+        - Standard CCM Admin Users
+        - Standard CCM Super Users
+        - Standard CTI Enabled
+        - Standard CTI Allow Control of Phones supporting Rollover Mode
+        - Standard CTI Allow Control of Phones supporting Connected Xfer and conf
+
+  authentication:
+    search_base: ou=Validate,dc=example,dc=com
+
+
+# GDPR settings
+gdpr:
+  route_string: emea.route
+  # registration w/ us-cm-pub.example.com
+  registration_server: 192.168.220.20
+  password: <ils password>
+  learned_partition: OnNetRemote
+  update_interval_minutes: 1
+
+imp_publish_trunk:
+  destinations:
+    # emea-imp-pub, emea-imp-sub1
+    - 192.168.230.25
+    - 192.168.230.26
+
+# routing configuration: ICT trunk to route based on GDPR
+routing:
+  routegroups:
+    US:
+      members:
+      - US
+  routelists:
+    RL_US:
+      description: RL to US cluster
+      members:
+        - US
+  siproutes:
+    us.route:
+      description: GDPR route to US
+      destination: RL_US
+      partition: OnNetRemote
+
+  siptrunks:
+    US:
+      description: ICT to US cluster
+      profile: FQDN
+      incomingPort: 5060
+      incomingCss: ICTInbound
+      destinations:
+      - 192.168.220.20
+      - 192.168.220.21
+
+selfprovisioning:
+  partition: SELFPROV
+  css: SELFPROV
+  device_pool: SELFPROV
+  cti_rp_name: CTIRP_SELFPROV
+  cti_rp_dn: 9999
+  app_user: SELFPROV
+  app_user_password: <some password>
+  phone_button_template_name: PB_SELFPROV
+  udt_name: UDT_SELFPROV
+  ult_name: ULT_SELFPROV
+
