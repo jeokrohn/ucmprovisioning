@@ -1,4 +1,4 @@
-# Python automation for Unified CM configuration
+# Python automation for Cisco Unified CM configuration
 
 These scripts allow to automate configuration of a Cisco Unified CM setup in line with the 
 best practices layed out in the 

@@ -1446,7 +1446,8 @@ class UCMConfigurator:
         r = self.axl.do_device_reset(name=name, is_mgcp=False, is_hard_reset=False, reset_type='Reset')
 
         # find all devices associated with that DN
-        r = self.axl.getLine(pattern=pattern, routePartitionName='DN')
+        r = self.axl.getLine(pattern=pattern, routePartitionName='DN',
+                             returnedTags={'pattern': '', 'routePartitionName': ''})
 
         # uuid in thick AXL is uppercase and as curly brackets at the start/end
         dn_uuid = r['return']['line']['uuid']
@@ -1596,7 +1597,7 @@ def main():
     for config_selector in ['example']:
         config_file_name = 'config_{}.yml'.format(config_selector)
         with open(config_file_name, 'r') as f:
-            config = yaml.load(f)
+            config = yaml.safe_load(f)
 
         configurator = UCMConfigurator(config)
 
