@@ -9,7 +9,12 @@ import requests
 import tempfile
 import os
 from collections import OrderedDict
+import re
+import tempfile
+import zipfile
+import logging
 
+log = logging.getLogger(__name__)
 
 class AXLHelper:
     def __init__(self, ucm_host, auth, version=None, verify=None, timeout=60):
@@ -31,14 +36,26 @@ class AXLHelper:
         if verify is not None:
             self.session.verify = verify
 
-        if version is None:
-            # Somehow determine the UCM version
-            raise Exception('Not implemented')
+        version = version or self._get_version()
 
         wsdl_version = version
 
         self.wsdl = os.path.join(os.path.dirname(__file__), 'WSDL', wsdl_version, 'AXLAPI.wsdl')
-
+        temp_dir = None
+        if not os.path.isfile(self.wsdl):
+            log.debug(f'__init__: WSDL not found: {self.wsdl}')
+            # we need to download the wsdl from UCM
+            temp_dir = tempfile.TemporaryDirectory()
+            temp_zip_file_name = os.path.join(temp_dir.name, 'axlsqltoolkit.zip')
+            r = self.session.get(f'https://{self.ucm_host}/plugins/axlsqltoolkit.zip')
+            with open(temp_zip_file_name, 'wb') as f:
+                f.write(r.content)
+            log.debug(f'__init__: downloaded {temp_zip_file_name}')
+            with zipfile.ZipFile(temp_zip_file_name, 'r') as zip:
+                zip.extractall(path=temp_dir.name)
+            log.debug(f'__init__: extracted {temp_zip_file_name}')
+            self.wsdl = os.path.join(temp_dir.name, 'schema', 'current', 'AXLAPI.wsdl')
+            log.debug(f'__init__: using {self.wsdl}')
         self.cache = zeep.cache.SqliteCache(
             path=os.path.join(tempfile.gettempdir(), 'sqlite_{}.db'.format(self.ucm_host)),
             timeout=60)
@@ -51,7 +68,35 @@ class AXLHelper:
 
         self.service = self.client.create_service('{http://www.cisco.com/AXLAPIService/}AXLAPIBinding',
                                                   self.axl_url)
+        if temp_dir:
+            # remove temporary WSDL directory and temp files
+            log.debug(f'__init__: cleaning up temp dir {temp_dir.name}')
+            temp_dir.cleanup()
         return
+
+    def _get_version(self):
+        """
+        Get UCM version w/o using zeep.
+        Used to determine UCM version if no version is given on initialization
+        :return: UCM version
+        """
+        # try for a number of UCM versions
+        for major_version in [12, 11, 10, 14, 9, 8]:
+            soap_envelope = (f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+                             f'xmlns:ns="http://www.cisco.com/AXL/API/{major_version}.0"><soapenv:Header/>'
+                             f'<soapenv:Body><ns:getCCMVersion></ns:getCCMVersion></soapenv:Body></soapenv:Envelope>')
+            headers = {'Content-Type': 'text/xml',
+                       'SOAPAction': f'CUCM:DB ver={major_version}.0 getCCMVersion'}
+            r = self.session.post(self.axl_url, data=soap_envelope, headers=headers)
+            if r.status_code == 599:
+                continue
+            r.raise_for_status()
+            log.debug(f'_get_version: reply from UCM: {r.text}')
+            m = re.search(r'<version>(\d+)\.(\d+)\..+</version>', r.text)
+            version = f'{m.group(1)}.{m.group(2)}'
+            log.debug(f'_get_version: assuming version {version}')
+            return version
+        return ''
 
     def __getattr__(self, item):
         """
@@ -187,14 +232,13 @@ class AXLHelper:
         return r
 
     ############### user
-    def list_user(self, **search_criteria):
-        returned_tags = search_criteria.pop('returnedTags', None)
+    def list_user(self, returnedTags=None, **search_criteria):
         search_criteria = self.filter_search_criteria(search_criteria,
                                                       ['firstName', 'lastName', 'userid', 'department'],
                                                       'userid')
-        if returned_tags is None:
-            returned_tags = {'uuid': '', 'userid': '', 'firstName': '', 'lastName': ''}
-        r = self.service.listUser(searchCriteria=search_criteria, returnedTags=returned_tags)
+
+        returnedTags = returnedTags or {'uuid': '', 'userid': '', 'firstName': '', 'lastName': ''}
+        r = self.service.listUser(searchCriteria=search_criteria, returnedTags=returnedTags)
         return self.handle_list_response(r)
 
     ############### CSS
@@ -230,7 +274,7 @@ class AXLHelper:
         return self.handle_list_response(r)
 
     def get_route_partition(self, **search_criteria):
-        search_criteria = self.filter_search_criteria(search_criteria, ['name', 'uuid'])
+        search_criteria = self.filter_search_criteria(search_criteria, ['name', 'uuid'], 'name')
         assert search_criteria is not None, 'Search criteria mantatory'
         assert len(search_criteria) == 1, 'Only name or uuid can be used'
 
@@ -263,6 +307,31 @@ class AXLHelper:
             p = self.update_route_partition(name=name, description=description)
         return p
 
+    ################ route list
+    def get_route_list(self, **search_criteria):
+        search_criteria = self.filter_search_criteria(search_criteria, ['name', 'uuid'], 'name')
+        assert search_criteria is not None, 'Search criteria mantatory'
+        assert len(search_criteria) == 1, 'Only name or uuid can be used'
+
+        tags = ['name', 'description', 'callManagerGroupName', 'routeListEnabled']
+        try:
+            r = self.service.getRouteList(returnedTags={t: '' for t in tags}, **search_criteria)
+        except zeep.exceptions.Fault as e:
+            if e.message.startswith('Item not valid'):
+                return None
+            raise
+        r = zeep.helpers.serialize_object(r['return']['routeList'])
+        return r
+
+    def add_update_route_list(self, **values):
+        try:
+            r = self.service.getRouteList(name=values['name'])
+        except zeep.exceptions.Fault as e:
+            r = self.service.addRouteList(routeList=values)
+        else:
+            r = self.service.updateRouteList(**values)
+        return r['return']
+
     ################ route pattern
     ROUTE_PATTERN_TAGS = ['pattern', 'description', 'usage', 'routePartitionName', 'blockEnable',
                           'calledPartyTransformationMask',
@@ -274,22 +343,25 @@ class AXLHelper:
                           'provideOutsideDialtone', 'callingPartyNumberingPlan', 'callingPartyNumberType',
                           'calledPartyNumberingPlan', 'calledPartyNumberType', 'authorizationCodeRequired',
                           'authorizationLevelRequired', 'clientCodeRequired', 'withTag', 'withValueClause',
-                          'resourcePriorityNamespaceName', 'routeClass', 'externalCallControl',
-                          'isEmergencyServiceNumber']
+                          'resourcePriorityNamespaceName', 'routeClass', 'externalCallControl']
 
-    def list_route_pattern(self, **search_criteria):
+    def list_route_pattern(self, returned_tags=None, **search_criteria):
         search_criteria = self.filter_search_criteria(search_criteria, ['pattern', 'description', 'routePartitionName'],
                                                       'pattern')
+        returned_tags = returned_tags or self.ROUTE_PATTERN_TAGS
+
         r = self.service.listRoutePattern(searchCriteria=search_criteria,
-                                          returnedTags={t: '' for t in self.ROUTE_PATTERN_TAGS})
+                                          returnedTags={t: '' for t in returned_tags})
         return self.handle_list_response(r)
 
-    def get_route_pattern(self, **search_criteria):
+    def get_route_pattern(self, returned_tags=None, **search_criteria):
         search_criteria = self.filter_search_criteria(search_criteria, ['uuid', 'pattern', 'routePartitionName'])
         assert search_criteria is not None, 'Search criteria mantatory'
 
+        returned_tags = returned_tags or self.ROUTE_PATTERN_TAGS
+
         try:
-            r = self.service.getRoutePattern(returnedTags={t: '' for t in self.ROUTE_PATTERN_TAGS}, **search_criteria)
+            r = self.service.getRoutePattern(returnedTags={t: '' for t in returned_tags}, **search_criteria)
         except zeep.exceptions.Fault as e:
             if e.message.startswith('Item not valid'):
                 return None
@@ -311,19 +383,19 @@ class AXLHelper:
             'pattern': pattern,
             'routePartitionName': partition,
             'description': description,
-            'blockEnable': 'false',
+            'blockEnable': False,
             'calledPartyTransformationMask': '',
             'callingPartyTransformationMask': '',
             'useCallingPartyPhoneMask': 'Off',
             'callingPartyPrefixDigits': '',
             'digitDiscardInstructionName': '',
-            'patternUrgency': 'false',
+            'patternUrgency': False,
             'prefixDigitsOut': '',
             'routeFilterName': '',
-            'supportOverlapSending': 'false',
+            'supportOverlapSending': False,
             'patternPrecedence': 'Default',
-            'provideOutsideDialtone': 'true',
-            'authorizationCodeRequired': 'false',
+            'provideOutsideDialtone': True,
+            'authorizationCodeRequired': False,
             'authorizationLevelRequired': '0',
             'externalCallControl': '',
             'destination': {'routeListName': route_list_name}
@@ -338,6 +410,29 @@ class AXLHelper:
 
     def remove_route_pattern(self, uuid):
         r = self.service.removeRoutePattern(uuid=uuid)
+        return r
+
+    ######### called party transforms
+    CDPTX_TAGS = ['pattern', 'description', 'usage', 'routePartitionName', 'calledPartyTransformationMask',
+                  'dialPlanName', 'digitDiscardInstructionName', 'patternUrgency', 'routeFilterName',
+                  'calledPartyPrefixDigits', 'calledPartyNumberingPlan', 'calledPartyNumberType',
+                  'mlppPreemptionDisabled']
+
+    def list_called_party_transformation_pattern(self, **search_criteria):
+        search_criteria = self.filter_search_criteria(search_criteria,
+                                                      ['pattern', 'description', 'routePartitionName', 'dialPlanName',
+                                                       'routeFilterName'],
+                                                      'pattern')
+        r = self.service.listCalledPartyTransformationPattern(searchCriteria=search_criteria,
+                                                              returnedTags={t: '' for t in self.CDPTX_TAGS})
+        return self.handle_list_response(r)
+
+    def add_called_party_transformation_pattern(self, **values):
+        r = self.service.addCalledPartyTransformationPattern(calledPartyTransformationPattern=values)
+        return r['return']
+
+    def remove_called_party_transformation_pattern(self, uuid):
+        r = self.service.removeCalledPartyTransformationPattern(uuid=uuid)
         return r
 
     ######### SIP profile
@@ -366,8 +461,8 @@ class AXLHelper:
     def add_update_sip_profile(self, sip_profile):
         standard_sip_profile = {
             'defaultTelephonyEventPayloadType': '101',
-            'redirectByApplication': 'false',
-            'ringing180': 'false',
+            'redirectByApplication': False,
+            'ringing180': False,
             'timerInvite': '180',
             'timerRegisterDelta': '5',
             'timerRegister': '3600',
@@ -401,60 +496,61 @@ class AXLHelper:
             'timerOffHookToFirstDigit': '15000',
             'callForwardUri': 'x-cisco-serviceuri-cfwdall',
             'abbreviatedDialUri': 'x-cisco-serviceuri-abbrdial',
-            'confJointEnable': 'true',
-            'rfc2543Hold': 'false',
-            'semiAttendedTransfer': 'true',
-            'enableVad': 'false',
-            'stutterMsgWaiting': 'false',
-            'callStats': 'false',
-            't38Invite': 'false',
-            'faxInvite': 'false',
+            'confJointEnable': True,
+            'rfc2543Hold': False,
+            'semiAttendedTransfer': True,
+            'enableVad': False,
+            'stutterMsgWaiting': False,
+            'callStats': False,
+            't38Invite': False,
+            'faxInvite': False,
             'rerouteIncomingRequest': 'Never',
             'resourcePriorityNamespaceListName': '',
-            'enableAnatForEarlyOfferCalls': 'false',
+            'enableAnatForEarlyOfferCalls': False,
             'rsvpOverSip': 'Local RSVP',
-            'fallbackToLocalRsvp': 'true',
+            'fallbackToLocalRsvp': True,
             'sipRe11XxEnabled': 'Disabled',
             'gClear': 'Disabled',
-            'sendRecvSDPInMidCallInvite': 'false',
-            'enableOutboundOptionsPing': 'false',
+            'sendRecvSDPInMidCallInvite': False,
+            'enableOutboundOptionsPing': False,
             'optionsPingIntervalWhenStatusOK': '60',
             'optionsPingIntervalWhenStatusNotOK': '120',
-            'deliverConferenceBridgeIdentifier': 'false',
+            'deliverConferenceBridgeIdentifier': False,
             'sipOptionsRetryCount': '6',
             'sipOptionsRetryTimer': '500',
             'sipBandwidthModifier': 'TIAS and AS',
             'enableUriOutdialSupport': 'f',
             'userAgentServerHeaderInfo': 'Send Unified CM Version Information as User-Agent Header',
-            'allowPresentationSharingUsingBfcp': 'false',
+            'allowPresentationSharingUsingBfcp': False,
             'scriptParameters': '',
-            'isScriptTraceEnabled': 'false',
+            'isScriptTraceEnabled': False,
             'sipNormalizationScript': '',
-            'allowiXApplicationMedia': 'false',
-            'dialStringInterpretation': 'Phone number consists of characters 0-9, *, #, and + (others treated as URI addresses)',
+            'allowiXApplicationMedia': False,
+            'dialStringInterpretation': 'Phone number consists of characters 0-9, *, #, and + (others treated as URI '
+                                        'addresses)',
             'acceptAudioCodecPreferences': 'Default',
-            'mlppUserAuthorization': 'false',
-            'isAssuredSipServiceEnabled': 'false',
-            'enableExternalQoS': 'false',
+            'mlppUserAuthorization': False,
+            'isAssuredSipServiceEnabled': False,
+            'enableExternalQoS': False,
             'resourcePriorityNamespace': '',
-            'useCallerIdCallerNameinUriOutgoingRequest': 'false',
+            'useCallerIdCallerNameinUriOutgoingRequest': False,
             'callerIdDn': '',
             'callerName': '',
             'callingLineIdentification': 'Default',
-            'rejectAnonymousIncomingCall': 'false',
+            'rejectAnonymousIncomingCall': False,
             'callpickupUri': 'x-cisco-serviceuri-pickup',
-            'rejectAnonymousOutgoingCall': 'false',
+            'rejectAnonymousOutgoingCall': False,
             'videoCallTrafficClass': 'Mixed',
             'sdpTransparency': '',
-            'allowMultipleCodecs': 'false',
+            'allowMultipleCodecs': False,
             'sipSessionRefreshMethod': 'Invite',
             'earlyOfferSuppVoiceCall': 'Disabled (Default value)',
             'cucmVersionInSipHeader': 'Major And Minor',
             'confidentialAccessLevelHeaders': 'Disabled',
-            'destRouteString': 'false',
-            'inactiveSDPRequired': 'false',
-            'allowRRAndRSBandwidthModifier': 'false',
-            'connectCallBeforePlayingAnnouncement': 'false'
+            'destRouteString': False,
+            'inactiveSDPRequired': False,
+            'allowRRAndRSBandwidthModifier': False,
+            'connectCallBeforePlayingAnnouncement': False
         }
         profile = dict(standard_sip_profile)
         profile.update(**sip_profile)
@@ -470,12 +566,38 @@ class AXLHelper:
     ################ translation pattern
     TRANS_PATTERN_TAGS = ['pattern', 'description', 'routePartitionName']
 
-    def list_translation(self, **search_criteria):
+    def list_translation(self, returned_tags=None, **search_criteria):
+
+        returned_tags = returned_tags or self.TRANS_PATTERN_TAGS
+
         search_criteria = self.filter_search_criteria(search_criteria, ['pattern', 'description', 'routePartitionName'],
                                                       'pattern')
         r = self.service.listTransPattern(searchCriteria=search_criteria,
-                                          returnedTags={t: '' for t in self.TRANS_PATTERN_TAGS})
+                                          returnedTags={t: '' for t in returned_tags})
         return self.handle_list_response(r)
+
+    def add_translation(self, pattern, partition, description,
+                        digit_discard='', prefix_digits='',
+                        called_party_transformation_mask='',
+                        block_enable=False, urgency=True,
+                        outside_dial_tone=False, css_inheritance=True,
+                        dont_wait_for_idt=True):
+        translation = {
+            'pattern': pattern,
+            'routePartitionName': partition,
+            'description': description,
+            'usage': 'Translation',
+            'blockEnable': block_enable,
+            'patternUrgency': urgency,
+            'provideOutsideDialtone': outside_dial_tone,
+            'digitDiscardInstructionName': digit_discard,
+            'prefixDigitsOut': prefix_digits,
+            'useOriginatorCss': css_inheritance,
+            'dontWaitForIDTOnSubsequentHops': dont_wait_for_idt,
+            'calledPartyTransformationMask': called_party_transformation_mask
+        }
+        r = self.service.addTransPattern(transPattern=translation)
+        return r
 
     def add_update_translation(self, pattern, partition, description,
                                digit_discard='', prefix_digits='',
@@ -527,7 +649,7 @@ class AXLHelper:
             'callingLinePresentationBit': 'Default',
             'callingPartyNumberingPlan': plan,
             'callingPartyNumberType': type,
-            'mlppPreemptionDisabled': 'false'
+            'mlppPreemptionDisabled': False
         }
         try:
             p = self.service.getCallingPartyTransformationPattern(pattern=pattern,
@@ -555,15 +677,6 @@ class AXLHelper:
             lrg = {'uuid': r['return']['localRouteGroup']['uuid'], 'name': name, 'description': description,
                    'newName': name, 'newDescription': description}
             r = self.service.updateLocalRouteGroup(localRouteGroup=lrg)
-        return r['return']
-
-    def add_update_route_list(self, **values):
-        try:
-            r = self.service.getRouteList(name=values['name'])
-        except zeep.exceptions.Fault as e:
-            r = self.service.addRouteList(routeList=values)
-        else:
-            r = self.service.updateRouteList(**values)
         return r['return']
 
     def add_update_advertised_pattern(self, pattern, description, pattern_type,
@@ -603,9 +716,8 @@ class AXLHelper:
         return r['return']
 
     def add_update_line(self, dn):
-        returned_tags = {k:'' for k in dn.keys()}
         try:
-            r = self.service.getLine(pattern=dn['pattern'], routePartitionName=dn['routePartitionName'], returnedTags = returned_tags)
+            r = self.service.getLine(pattern=dn['pattern'], routePartitionName=dn['routePartitionName'])
         except zeep.exceptions.Fault as e:
             r = self.service.addLine(line=dn)
         else:
@@ -660,18 +772,18 @@ class AXLHelper:
             'securityMode': 'Non Secure',
             'incomingTransport': 'TCP+UDP',
             'outgoingTransport': 'TCP',
-            'digestAuthentication': 'false',
+            'digestAuthentication': False,
             'noncePolicyTime': '600',
             'x509SubjectName': '',
             'incomingPort': '5060',
-            'applLevelAuthentication': 'false',
-            'acceptPresenceSubscription': 'false',
-            'acceptOutOfDialogRefer': 'false',
-            'acceptUnsolicitedNotification': 'false',
-            'allowReplaceHeader': 'false',
-            'transmitSecurityStatus': 'false',
+            'applLevelAuthentication': False,
+            'acceptPresenceSubscription': False,
+            'acceptOutOfDialogRefer': False,
+            'acceptUnsolicitedNotification': False,
+            'allowReplaceHeader': False,
+            'transmitSecurityStatus': False,
             'sipV150OutboundSdpOfferFiltering': 'Use Default Filter',
-            'allowChargingHeader': 'false'
+            'allowChargingHeader': False
         }
         security_profile = dict(default_security_profile)
         security_profile.update(**profile)
@@ -703,26 +815,26 @@ class AXLHelper:
             'packetCaptureMode': 'None',
             'packetCaptureDuration': '0',
             'loadInformation': '',
-            'traceFlag': 'false',
+            'traceFlag': False,
             'mlppIndicationStatus': 'Off',
             'preemption': 'Disabled',
             'useTrustedRelayPoint': 'Default',
-            'retryVideoCallAsAudio': 'true',
+            'retryVideoCallAsAudio': True,
             'securityProfileName': 'Non Secure SIP Trunk Profile',
             'sipProfileName': 'Standard SIP Profile',
             'cgpnTransformationCssName': '',
-            'useDevicePoolCgpnTransformCss': 'true',
+            'useDevicePoolCgpnTransformCss': True,
             'geoLocationName': '',
             'geoLocationFilterName': '',
-            'sendGeoLocation': 'false',
+            'sendGeoLocation': False,
             'cdpnTransformationCssName': '',
-            'useDevicePoolCdpnTransformCss': 'true',
-            'unattendedPort': 'false',
-            'transmitUtf8': 'false',
+            'useDevicePoolCdpnTransformCss': True,
+            'unattendedPort': False,
+            'transmitUtf8': False,
             'subscribeCallingSearchSpaceName': '',
             'rerouteCallingSearchSpaceName': '',
             'referCallingSearchSpaceName': '',
-            'mtpRequired': 'false',
+            'mtpRequired': False,
             'presenceGroupName': 'Standard Presence group',
             'unknownPrefix': 'Default',
             'tkSipCodec': '711ulaw',
@@ -734,24 +846,24 @@ class AXLHelper:
             'prefixDn': '',
             'callerName': '',
             'callerIdDn': '',
-            'acceptInboundRdnis': 'true',
-            'acceptOutboundRdnis': 'true',
-            'srtpAllowed': 'false',
-            'srtpFallbackAllowed': 'true',
-            'isPaiEnabled': 'true',
+            'acceptInboundRdnis': True,
+            'acceptOutboundRdnis': True,
+            'srtpAllowed': False,
+            'srtpFallbackAllowed': True,
+            'isPaiEnabled': True,
             'sipPrivacy': 'Default',
-            'isRpidEnabled': 'true',
+            'isRpidEnabled': True,
             'sipAssertedType': 'Default',
             'dtmfSignalingMethod': 'No Preference',
             'routeClassSignalling': 'Default',
             'sipTrunkType': 'None(Default)',
-            'pstnAccess': 'false',
+            'pstnAccess': False,
             'imeE164TransformationName': '',
-            'useImePublicIpPort': 'false',
-            'useDevicePoolCntdPnTransformationCss': 'true',
-            'useDevicePoolCgpnTransformCssUnkn': 'true',
+            'useImePublicIpPort': False,
+            'useDevicePoolCntdPnTransformationCss': True,
+            'useDevicePoolCgpnTransformCssUnkn': True,
             'sipNormalizationScriptName': '',
-            'runOnEveryNode': 'true',
+            'runOnEveryNode': True,
         }
         sip_trunk = dict(default_sip_trunk)
         sip_trunk.update(**trunk)
