@@ -716,8 +716,9 @@ class AXLHelper:
         return r['return']
 
     def add_update_line(self, dn):
+        returned_tags = {k:'' for k in dn.keys()}
         try:
-            r = self.service.getLine(pattern=dn['pattern'], routePartitionName=dn['routePartitionName'])
+            r = self.service.getLine(pattern=dn['pattern'], routePartitionName=dn['routePartitionName'], returnedTags = returned_tags)
         except zeep.exceptions.Fault as e:
             r = self.service.addLine(line=dn)
         else:
