@@ -5,6 +5,7 @@ import zeep
 import zeep.cache
 import zeep.helpers
 import zeep.exceptions
+from zeep.plugins import HistoryPlugin
 import requests
 import tempfile
 import os
@@ -59,12 +60,13 @@ class AXLHelper:
         self.cache = zeep.cache.SqliteCache(
             path=os.path.join(tempfile.gettempdir(), 'sqlite_{}.db'.format(self.ucm_host)),
             timeout=60)
-
+        self.history = HistoryPlugin()
         self.client = zeep.Client(wsdl=self.wsdl,
                                   transport=zeep.Transport(timeout=timeout,
                                                            operation_timeout=timeout,
                                                            cache=self.cache,
-                                                           session=self.session))
+                                                           session=self.session),
+                                  plugins=[self.history])
 
         self.service = self.client.create_service('{http://www.cisco.com/AXLAPIService/}AXLAPIBinding',
                                                   self.axl_url)
